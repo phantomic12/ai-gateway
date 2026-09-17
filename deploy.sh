@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Deploy ai-gateway on rainbowone.
-# Idempotent: re-running pulls latest main, keeps .env and ./data untouched,
-# rebuilds, restarts.
+# Idempotent: re-running pulls latest upstream main, keeps .env and ./data
+# untouched, rebuilds, restarts.
 #
-# Source of truth for both the compose overlay and this script is the fork at
-# phantomic12/ai-gateway; both files live at the repo root. Do not hand-edit the
-# copies under ~/ai-gateway — this script overwrites them on every run.
+# compose overlay + this script are host-local (not tracked upstream). The
+# canonical copies live at /home/yoav/ai-gateway-deploy/ and are copied into the
+# checkout on every run, so edits belong here, not in ~/ai-gateway.
 set -euo pipefail
 
 DIR=/home/yoav/ai-gateway
-REPO=https://github.com/phantomic12/ai-gateway.git
+REPO=https://github.com/karutoil/ai-gateway.git
 BRANCH=main
 HOST_PORT=8090
 PUBLIC_URL=http://100.99.145.19:${HOST_PORT}
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE_ARGS=(-f docker-compose.yml -f docker-compose.rainbowone.yml)
 
 if [ ! -d "$DIR/.git" ]; then
@@ -27,26 +28,13 @@ fi
 cd "$DIR"
 mkdir -p data
 
-echo "==> syncing deploy files from $(dirname "$0")"
-# Tracked in the fork, so a reset --hard may already have refreshed them; copy
-# anyway so this script also works when run from a stale checkout elsewhere.
-for f in docker-compose.rainbowone.yml; do
-  if [ -f "$(dirname "$0")/$f" ]; then
-    cp "$(dirname "$0")/$f" "$DIR/$f"
-  fi
-done
+echo "==> syncing deploy files from $SELF_DIR"
+cp "$SELF_DIR/docker-compose.rainbowone.yml" "$DIR/docker-compose.rainbowone.yml"
+cp "$SELF_DIR/deploy.sh" "$DIR/deploy.sh"
+chmod +x "$DIR/deploy.sh"
+# Stale hand-edited backup from before the !override fix; would be picked up by
+# an accidental `-f *.yml` glob, so drop it.
 rm -f "$DIR/docker-compose.rainbowone.yml.bak"
-
-# Legacy hand-copied deployment dir: superseded by the files now tracked in the
-# repo root. Kept as a redirect so older muscle memory does not run a stale copy.
-if [ -d /home/yoav/ai-gateway-deploy ]; then
-  cat > /home/yoav/ai-gateway-deploy/README.md <<'EOF'
-Superseded. The deployment overlay (docker-compose.rainbowone.yml) and deploy.sh
-now live in the repo root and are tracked in phantomic12/ai-gateway.
-
-Run: bash /home/yoav/ai-gateway/deploy.sh
-EOF
-fi
 
 if [ ! -f .env ]; then
   echo "==> generating .env with fresh secrets"
@@ -69,10 +57,21 @@ else
 fi
 
 # A base-file port mapping the overlay forgot to override makes the container
-# fail to start with "port is already allocated". Fail loudly instead of leaving
-# a half-up stack behind.
-if ! docker compose "${COMPOSE_ARGS[@]}" config | grep -q '"8090:8080"'; then
-  echo "!! compose config does not expose 8090:8080 — check the !override tag" >&2
+# fail to start with "port is already allocated" (compose would render two
+# entries for target 8080). `config` renders long form with block-sequence
+# indentation that varies by compose version, so count the "- mode:" list items
+# under the gateway ports key instead of matching fixed indentation.
+port_count=$(docker compose "${COMPOSE_ARGS[@]}" config \
+  | awk '/^[[:space:]]*ports:[[:space:]]*$/{inports=1; next}
+         inports && /^[[:space:]]*-[[:space:]]*mode:/{c++; next}
+         inports && /^[[:space:]]*[a-z_-]+:/{inports=0}
+         END{print c+0}')
+if [ "$port_count" != "1" ]; then
+  echo "!! expected exactly 1 published port mapping, got ${port_count} — check the !override tag" >&2
+  exit 1
+fi
+if ! docker compose "${COMPOSE_ARGS[@]}" config | grep -q 'published: "8090"'; then
+  echo "!! compose config does not publish host port 8090" >&2
   exit 1
 fi
 
