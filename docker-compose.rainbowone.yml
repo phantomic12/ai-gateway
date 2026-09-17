@@ -1,0 +1,38 @@
+# AI Gateway — rainbowone deployment overlay.
+# Built from the repo checkout in this directory (karutoil/ai-gateway).
+#
+# Usage (from the repo root):
+#   docker compose -f docker-compose.yml -f docker-compose.rainbowone.yml up -d --build
+#
+# This file is an OVERLAY on docker-compose.yml, so `ports:` must be tagged
+# !override — otherwise compose APPENDS to the base "8080:8080" and the second
+# mapping loses the port race at start.
+#
+# Host port 8090 -> container 8080 (host 8080 is taken by Infisical).
+services:
+  gateway:
+    build:
+      context: .
+    image: ai-gateway:rainbowone
+    container_name: ai-gateway
+    ports: !override
+      - "8090:8080"
+    env_file:
+      - .env
+    environment:
+      PORT: 8080
+      DATABASE_URL: /data/gateway.db
+    volumes:
+      - ./data:/data
+    # The image's built-in uid 10001 can't write the host bind mount (owned by
+    # yoav/1000) and this host has no passwordless sudo to chown it. Run as the
+    # host user instead — still non-root, and ./data stays easy to back up.
+    user: "1000:1000"
+    # Image ships without curl/wget; probe the listener with bash's /dev/tcp.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
