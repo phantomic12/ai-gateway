@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"ai-gateway/internal/httperr"
@@ -104,9 +105,17 @@ func (b *bufWriter) flushTo(w http.ResponseWriter) {
 //     (round-robin / random / weighted pick a single serving member;
 //     failover returns the whole position-ordered list so proxyCandidates
 //     walks it on retriable failures).
-//   - Otherwise: LegacyFallback=false (default) rejects the request — the
-//     caller surfaces model_not_routed; LegacyFallback=true restores the
-//     legacy resolution (health-aware ownership round-robin, name/type
+//   - Otherwise discovered ownership decides: if exactly one provider
+//     advertises the model (qualified or bare slug in provider_models) it
+//     serves. If SEVERAL providers advertise the same slug, strict mode
+//     returns the whole owner set rotated per request — proxyCandidates
+//     spreads load across them and fails over owner-to-owner on retriable
+//     failures (a reseller's 403 "access disabled" or 429 shouldn't kill a
+//     request other owners can serve). LegacyFallback=true keeps its single
+//     health-aware pick for that case.
+//   - Otherwise (no owner at all): LegacyFallback=false (default) rejects
+//     the request — the caller surfaces model_not_routed;
+//     LegacyFallback=true restores the legacy resolution (name/type
 //     heuristics, default provider).
 //
 // Same-provider retries inside proxyWithMetrics remain active per the retry
@@ -223,8 +232,36 @@ func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg strin
 		}
 	}
 
-	// 4. No rule and no pin: reject by default, or resolve via legacy
-	// heuristics when the operator opted back in.
+	// 4. No rule and no pin: serve from discovered ownership. Exactly one
+	// provider advertises the slug (qualified or bare) → it serves, in both
+	// modes. 2+ providers advertise the SAME slug: strict mode serves the
+	// whole owner set, rotated per request — the old "reject" behavior made
+	// identical slugs across providers unusable by bare name even though
+	// every owner can serve them, and legacy's single health-aware pick had
+	// no failover when the picked reseller 403/429'd. The rotated chain
+	// spreads load AND walks to the next owner on retriable failures.
+	// Qualified IDs (step 2) and X-Provider (step 1) stay the deterministic
+	// pins; an LB rule (step 3) always beats implicit ownership.
+	owned := h.ownerCandidates(model, keyOrg)
+	if len(owned) == 1 {
+		consider(owned[0])
+		if len(out) > 0 {
+			return out, nil
+		}
+		// pred rejected the sole owner: fall through (strict returns the
+		// honest empty result below; legacy heuristics below can't do
+		// better — Resolve returns the same provider).
+	} else if len(owned) > 1 && !h.LegacyFallback {
+		for _, p := range rotateOwners(owned) {
+			consider(p)
+		}
+		if len(out) > 0 {
+			return out, nil
+		}
+	}
+
+	// 5. No rule, no pin, no usable owner: reject in strict mode; in legacy
+	// mode a heuristic may still land on the default provider.
 	if !h.LegacyFallback {
 		return nil, nil
 	}
@@ -247,6 +284,39 @@ func (h *Handler) candidateProvidersWithRule(rawModel, model, hint, keyOrg strin
 }
 
 type prepareFn func(p *models.Provider, body []byte) (target, apiKey string, outBody []byte, isAnth bool, err error)
+
+// ownerCandidates lists providers advertising this model (qualified or bare
+// slug), org-filtered for scoped keys. ListForModel already orders healthy
+// first, then by creation order.
+func (h *Handler) ownerCandidates(model, keyOrg string) []*models.Provider {
+	if h.ProviderStore == nil || model == "" {
+		return nil
+	}
+	var out []*models.Provider
+	for _, p := range h.ProviderStore.ListForModel(model) {
+		if orgAllows(keyOrg, p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// ownerRotation spreads ambiguous-owner requests across the owners of a
+// shared slug.
+var ownerRotation atomic.Uint64
+
+// rotateOwners reorders the owner list so request N starts at owner N%len:
+// the first entry serves while healthy, the rest stay as failover targets.
+func rotateOwners(owned []*models.Provider) []*models.Provider {
+	if len(owned) < 2 {
+		return owned
+	}
+	start := int(ownerRotation.Add(1)-1) % len(owned)
+	out := make([]*models.Provider, 0, len(owned))
+	out = append(out, owned[start:]...)
+	out = append(out, owned[:start]...)
+	return out
+}
 
 // shouldFailoverFrom reports whether a status justifies trying the next
 // candidate provider. The old rule stopped at ANY <500 — including 429 quota

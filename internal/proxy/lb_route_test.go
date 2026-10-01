@@ -25,19 +25,20 @@ import (
 // lbHarness wires a gateway with two providers (a/b) both serving gpt-4o-mini,
 // plus a third provider "pinme" used to prove pin-bypass and group exclusivity.
 type lbHarness struct {
-	srv       *httptest.Server
-	h         *Handler
-	key       string
-	hitsA     atomic.Int32
-	hitsB     atomic.Int32
-	hitsPinme atomic.Int32
-	bodyA     string // returns 200 "from-a"
-	bodyB     string // returns 200 "from-b"
-	failA     bool
-	lbStore   *lb.Store
-	paID      string
-	pbID      string
-	ppID      string
+	srv         *httptest.Server
+	h           *Handler
+	key         string
+	hitsA       atomic.Int32
+	hitsB       atomic.Int32
+	hitsPinme   atomic.Int32
+	bodyA       string // returns 200 "from-a"
+	bodyB       string // returns 200 "from-b"
+	failA       bool
+	failAStatus int // status used when failA (default 500)
+	lbStore     *lb.Store
+	paID        string
+	pbID        string
+	ppID        string
 }
 
 func newLBHarness(t *testing.T, ruleProviders []string, failA bool) *lbHarness {
@@ -53,7 +54,11 @@ func newLBHarness(t *testing.T, ruleProviders []string, failA bool) *lbHarness {
 	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hh.hitsA.Add(1)
 		if hh.failA {
-			w.WriteHeader(500)
+			status := hh.failAStatus
+			if status == 0 {
+				status = 500
+			}
+			w.WriteHeader(status)
 			w.Write([]byte(`{"error":{"message":"a down"}}`))
 			return
 		}
@@ -281,8 +286,9 @@ func TestLBFailingMemberErrorsHonest(t *testing.T) {
 	}
 }
 
-// Bare model names with no routing rule are rejected with 404 model_not_routed
-// (legacy heuristics are off by default) — no upstream is contacted.
+// Bare model names nobody owns (no routing rule, no provider_models
+// ownership, no pin) are rejected with 404 model_not_routed (strict default)
+// — no upstream is contacted.
 func TestBareModelWithoutRuleRejected(t *testing.T) {
 	hh := newLBHarness(t, nil, false)
 	code, body := hh.do(t, "unrouted-model", "")
@@ -297,13 +303,54 @@ func TestBareModelWithoutRuleRejected(t *testing.T) {
 	}
 }
 
-// The strict default does not silently send unrouted models to the default
-// provider even when providers exist that could theoretically serve them.
-func TestUnroutedModelIgnoresDefaultProvider(t *testing.T) {
+// A model advertised by several providers but absent from lb_rules is NOT an
+// error: the owner set serves it, rotated per request so load spreads, and
+// a failing owner fails over to the next. This is the identical-slug case
+// that used to return model_not_routed forever.
+func TestIdenticalSlugAcrossProvidersServes(t *testing.T) {
+	hh := newLBHarness(t, nil, false) // both prov-a and prov-b own gpt-4o-mini
+	var a, b int
+	for i := 0; i < 6; i++ {
+		code, body := hh.do(t, "gpt-4o-mini", "")
+		if code != 200 {
+			t.Fatalf("req %d: identical-slug model must serve, got %d: %s", i, code, body)
+		}
+		if strings.Contains(body, "from-a") {
+			a++
+		} else if strings.Contains(body, "from-b") {
+			b++
+		}
+	}
+	if a == 0 || b == 0 {
+		t.Fatalf("rotation expected both owners to serve (a=%d b=%d)", a, b)
+	}
+	if hh.hitsPinme.Load() != 0 {
+		t.Fatal("non-member provider must not be touched")
+	}
+}
+
+// Identical-slug failover: the rotated first owner 403s (reseller "access
+// disabled" — retriable) → the request still succeeds from the other owner.
+func TestIdenticalSlugFailsOverAcrossOwners(t *testing.T) {
 	hh := newLBHarness(t, nil, false)
-	code, body := hh.do(t, "gpt-4o-mini", "")
+	hh.failA = true // prov-a 500s every request
+	hh.failAStatus = 403
+	// Rotation may start at either owner; every request must still land on b.
+	for i := 0; i < 4; i++ {
+		code, body := hh.do(t, "gpt-4o-mini", "")
+		if code != 200 || !strings.Contains(body, "from-b") {
+			t.Fatalf("req %d: dead owner must fail over to the live one, got %d: %s", i, code, body)
+		}
+	}
+}
+
+// No provider owns the model: strict mode must not silently fall through to
+// the default provider.
+func TestUnownedModelDoesNotUseDefaultProvider(t *testing.T) {
+	hh := newLBHarness(t, nil, false)
+	code, body := hh.do(t, "totally-unowned-model", "")
 	if code != 404 || !strings.Contains(body, "model_not_routed") {
-		t.Fatalf("provider_models ownership must not serve unrouted bare models: %d %s", code, body)
+		t.Fatalf("unowned models must be rejected, not defaulted: %d %s", code, body)
 	}
 }
 
