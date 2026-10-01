@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +44,250 @@ type rawModelList struct {
 		Created int64  `json:"created"`
 	} `json:"data"`
 	Object string `json:"object"`
+}
+
+// parseModelList decodes a /models response body of either {data:[...]}
+// shape (OpenAI list or Anthropic list) into rawModels, capturing both the
+// identity fields and any provider-DECLARED detail (pricing, limits,
+// capabilities). Providers that only list ids get nil Meta — the models.dev
+// catalog stays the fallback source for those, never an override of what the
+// provider itself says.
+func parseModelList(body []byte) []rawModel {
+	var list struct {
+		Data []map[string]interface{} `json:"data"`
+	}
+	if json.Unmarshal(body, &list) != nil {
+		return nil
+	}
+	var out []rawModel
+	for _, mm := range list.Data {
+		id, _ := mm["id"].(string)
+		if id == "" {
+			// Anthropic-style entries without id (rare): display_name is the
+			// only usable identifier.
+			id, _ = mm["display_name"].(string)
+		}
+		if id == "" {
+			continue
+		}
+		rm := rawModel{ID: id}
+		if dn, _ := mm["display_name"].(string); dn != "" && dn != id {
+			rm.DisplayName = dn
+		}
+		if owned, _ := mm["owned_by"].(string); owned != "" {
+			rm.OwnedBy = owned
+		}
+		rm.Meta = providerMetaFrom(mm)
+		out = append(out, rm)
+	}
+	return out
+}
+
+// rawModel is one entry of a provider's model listing. Meta is non-nil only
+// when the entry itself declared detail (OpenRouter pricing/limits,
+// Anthropic display names, OpenAI-compatible capability flags).
+type rawModel struct {
+	ID          string
+	OwnedBy     string
+	DisplayName string
+	Meta        *providerMeta
+}
+
+// providerMeta is provider-declared model detail harvested from the
+// /v1/models listing object. Pointer/zero semantics separate "declared as
+// zero" (a free route legitimately prices at 0) from "not declared": costs
+// use *float64, sizes use >0.
+type providerMeta struct {
+	ContextWindow, MaxOutput int
+	InputCost                *float64 // per 1M tokens
+	OutputCost               *float64
+	CacheReadCost            *float64
+	CacheWriteCost           *float64
+	Reasoning                *bool
+	ToolCall                 *bool
+	StructuredOutput         *bool
+	Attachment               *bool
+	Modalities               string // JSON array string, e.g. ["text","image"]
+}
+
+func strNum(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	}
+	return 0, false
+}
+
+func asMap(v interface{}) map[string]interface{} {
+	m, _ := v.(map[string]interface{})
+	return m
+}
+
+// providerMetaFrom extracts declared detail from one listing entry. Keys
+// cover the shapes seen in the wild: flat generic fields
+// (context_length/max_output_tokens/tool_call/...), OpenRouter's split
+// (pricing.* per token, architecture.* modalities, top_provider.* limits,
+// supported_parameters capability list) and LiteLLM-style booleans. Costs
+// are normalized to per-1M to match provider_models semantics.
+func providerMetaFrom(mm map[string]interface{}) *providerMeta {
+	m := &providerMeta{}
+	declared := false
+	for _, keys := range [2][]string{
+		{"context_length", "context_window", "max_context_length", "max_model_len"},
+		{"max_output_tokens", "max_completion_tokens", "max_tokens"},
+	} {
+		for _, k := range keys {
+			if v, ok := strNum(mm[k]); ok && v > 0 {
+				if keys[0] == "context_length" {
+					if m.ContextWindow == 0 {
+						m.ContextWindow = int(v)
+						declared = true
+					}
+				} else if m.MaxOutput == 0 {
+					m.MaxOutput = int(v)
+					declared = true
+				}
+			}
+		}
+	}
+	if tp := asMap(mm["top_provider"]); tp != nil {
+		if v, ok := strNum(tp["context_length"]); ok && v > 0 && m.ContextWindow == 0 {
+			m.ContextWindow = int(v)
+			declared = true
+		}
+		if v, ok := strNum(tp["max_completion_tokens"]); ok && v > 0 && m.MaxOutput == 0 {
+			m.MaxOutput = int(v)
+			declared = true
+		}
+	}
+	// Flat costs are already per-1M; pricing.* is per-token and scaled ×1e6.
+	num := func(dst **float64, k string) {
+		if v, ok := strNum(mm[k]); ok && v >= 0 {
+			*dst = &v
+			declared = true
+		}
+	}
+	num(&m.InputCost, "input_cost")
+	num(&m.OutputCost, "output_cost")
+	num(&m.CacheReadCost, "cache_read_cost")
+	num(&m.CacheWriteCost, "cache_write_cost")
+	if pr := asMap(mm["pricing"]); pr != nil {
+		perM := func(dst **float64, k string) {
+			if v, ok := strNum(pr[k]); ok && v >= 0 {
+				// Per-token → per-1M. ×1e6 produces float noise
+				// (0.0000002*1e6 = 0.19999999999999998); round to
+				// enough digits for any real pricing ($0.000001/1M).
+				per := math.Round(v*1_000_000*1e9) / 1e9
+				*dst = &per
+				declared = true
+			}
+		}
+		if m.InputCost == nil {
+			perM(&m.InputCost, "prompt")
+		}
+		if m.OutputCost == nil {
+			perM(&m.OutputCost, "completion")
+		}
+		if m.CacheReadCost == nil {
+			perM(&m.CacheReadCost, "input_cache_read")
+		}
+		if m.CacheWriteCost == nil {
+			perM(&m.CacheWriteCost, "input_cache_write")
+		}
+	}
+	boolFrom := func(dst **bool, k string) {
+		if v, ok := mm[k].(bool); ok {
+			*dst = &v
+			declared = true
+		}
+	}
+	boolFrom(&m.Reasoning, "reasoning")
+	boolFrom(&m.ToolCall, "tool_call")
+	boolFrom(&m.StructuredOutput, "structured_output")
+	boolFrom(&m.Attachment, "attachment")
+	// LiteLLM-style capability keys.
+	boolFrom(&m.ToolCall, "supports_function_calling")
+	boolFrom(&m.ToolCall, "supports_tool_choice")
+	boolFrom(&m.StructuredOutput, "supports_response_schema")
+	boolFrom(&m.Attachment, "supports_vision")
+	// OpenRouter-style capability list: ["tools","structured_outputs",
+	// "image_inputs","reasoning",...] — only fills what's absent, never
+	// contradicts an explicit boolean above.
+	if params, ok := mm["supported_parameters"].([]interface{}); ok {
+		has := func(want string) bool {
+			for _, p := range params {
+				if s, _ := p.(string); s == want {
+					return true
+				}
+			}
+			return false
+		}
+		t := true
+		if m.ToolCall == nil && has("tools") {
+			m.ToolCall = &t
+			declared = true
+		}
+		if m.StructuredOutput == nil && (has("structured_outputs") || has("response_format")) {
+			m.StructuredOutput = &t
+			declared = true
+		}
+		if m.Reasoning == nil && has("reasoning") {
+			m.Reasoning = &t
+			declared = true
+		}
+		if m.Attachment == nil && has("image_inputs") {
+			m.Attachment = &t
+			declared = true
+		}
+	}
+	if arch := asMap(mm["architecture"]); arch != nil {
+		// input_modalities is authoritative: non-text inputs → attachment.
+		if mods, ok := arch["input_modalities"].([]interface{}); ok && len(mods) > 0 {
+			nonText := false
+			for _, m2 := range mods {
+				if s2, _ := m2.(string); s2 != "" && s2 != "text" {
+					nonText = true
+				}
+			}
+			if m.Attachment == nil && nonText {
+				t := true
+				m.Attachment = &t
+				declared = true
+			}
+			if b, err := json.Marshal(mods); err == nil {
+				m.Modalities = string(b)
+				declared = true
+			}
+		} else if mod, _ := arch["modality"].(string); mod != "" {
+			// OpenRouter writes "text->text"; some write "text+image".
+			parts := strings.FieldsFunc(mod, func(r rune) bool { return r == '+' || r == '-' || r == '>' })
+			nonText := false
+			for _, s := range parts {
+				if s != "text" {
+					nonText = true
+				}
+			}
+			if m.Attachment == nil && nonText {
+				t := true
+				m.Attachment = &t
+				declared = true
+			}
+			if b, err := json.Marshal(parts); err == nil {
+				m.Modalities = string(b)
+				declared = true
+			}
+		}
+	}
+	if !declared {
+		return nil
+	}
+	return m
 }
 
 // Discover fetches /v1/models from provider and upserts provider_models, enriching from catalog
@@ -99,8 +346,14 @@ func (s *Service) Discover(providerID string) (int, error) {
 		return 0, fmt.Errorf("no models discovered (check provider base_url and key)")
 	}
 	count := 0
+	probeBudget := 8 // cap context probes per provider per run — each costs a request
 	for _, m := range fetched {
-		if err := s.upsert(p, m); err == nil {
+		// Providers whose /models carries no detail (kourier et al.) get
+		// catalog numbers describing the model's FULL capacity, not what
+		// this reseller serves (kourier caps deepseek-v4.1-flash at 262k,
+		// catalog says 1M). Probe once per bare-listed model until budget
+		// is spent; providers that declared their own numbers are trusted.
+		if err := s.upsert(p, m, apiKey, &probeBudget); err == nil {
 			count++
 		}
 	}
@@ -129,33 +382,8 @@ func (s *Service) fetchOpenAI(p *models.Provider, apiKey string) []rawModel {
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
 		resp.Body.Close()
-		var list rawModelList
-		if json.Unmarshal(body, &list) == nil && len(list.Data) > 0 {
-			var out []rawModel
-			for _, d := range list.Data {
-				out = append(out, rawModel{ID: d.ID, OwnedBy: d.OwnedBy})
-			}
+		if out := parseModelList(body); len(out) > 0 {
 			return out
-		}
-		// try anthropic-style response for openai compatible (some return different shape)
-		// fallback to generic map
-		var generic map[string]interface{}
-		if json.Unmarshal(body, &generic) == nil {
-			if data, ok := generic["data"].([]interface{}); ok {
-				var out []rawModel
-				for _, item := range data {
-					if mm, ok := item.(map[string]interface{}); ok {
-						id, _ := mm["id"].(string)
-						owned, _ := mm["owned_by"].(string)
-						if id != "" {
-							out = append(out, rawModel{ID: id, OwnedBy: owned})
-						}
-					}
-				}
-				if len(out) > 0 {
-					return out
-				}
-			}
 		}
 	}
 	return nil
@@ -176,31 +404,8 @@ func (s *Service) fetchAzure(p *models.Provider, apiKey string) []rawModel {
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
 		resp.Body.Close()
-		var list rawModelList
-		if json.Unmarshal(body, &list) == nil && len(list.Data) > 0 {
-			var out []rawModel
-			for _, d := range list.Data {
-				out = append(out, rawModel{ID: d.ID, OwnedBy: d.OwnedBy})
-			}
+		if out := parseModelList(body); len(out) > 0 {
 			return out
-		}
-		var generic map[string]interface{}
-		if json.Unmarshal(body, &generic) == nil {
-			if data, ok := generic["data"].([]interface{}); ok {
-				var out []rawModel
-				for _, item := range data {
-					if mm, ok := item.(map[string]interface{}); ok {
-						id, _ := mm["id"].(string)
-						owned, _ := mm["owned_by"].(string)
-						if id != "" {
-							out = append(out, rawModel{ID: id, OwnedBy: owned})
-						}
-					}
-				}
-				if len(out) > 0 {
-					return out
-				}
-			}
 		}
 	}
 	return nil
@@ -232,46 +437,32 @@ func (s *Service) fetchAnthropic(p *models.Provider, apiKey string) []rawModel {
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
 		resp.Body.Close()
-		var list rawModelList
-		if json.Unmarshal(body, &list) == nil && len(list.Data) > 0 {
-			var out []rawModel
-			for _, d := range list.Data {
-				out = append(out, rawModel{ID: d.ID, OwnedBy: d.OwnedBy})
-			}
+		if out := parseModelList(body); len(out) > 0 {
 			return out
-		}
-		// generic anthropic models shape: {data: [{id:...}]}
-		var generic map[string]interface{}
-		if json.Unmarshal(body, &generic) == nil {
-			if data, ok := generic["data"].([]interface{}); ok {
-				var out []rawModel
-				for _, item := range data {
-					if mm, ok := item.(map[string]interface{}); ok {
-						id, _ := mm["id"].(string)
-						if id == "" {
-							id, _ = mm["display_name"].(string)
-						}
-						if id != "" {
-							out = append(out, rawModel{ID: id})
-						}
-					}
-				}
-				if len(out) > 0 {
-					return out
-				}
-			}
 		}
 	}
 	return nil
 }
 
-type rawModel struct {
-	ID      string
-	OwnedBy string
-}
-
-func (s *Service) upsert(p *models.Provider, m rawModel) error {
-	e := s.enrichFor(m.ID)
+func (s *Service) upsert(p *models.Provider, m rawModel, apiKey string, probeBudget *int) error {
+	e := s.resolveEnrichment(m)
+	// Providers whose /models carries no detail (kourier et al.) get the
+	// model's catalog numbers — which describe the model's FULL capacity,
+	// not what this reseller actually serves (kourier caps deepseek-v4.1-
+	// flash at 262k, catalog says 1M). Probe once per bare-listed model
+	// while budget lasts; providers that declared numbers are trusted.
+	if m.Meta == nil && probeBudget != nil && *probeBudget > 0 {
+		*probeBudget--
+		if probe := s.probeContextLimit(p, apiKey, m.ID); probe > 0 {
+			if e.ctx == 0 || probe < e.ctx {
+				e.ctx = probe
+			}
+			if e.maxOut == 0 || probe < e.maxOut {
+				e.maxOut = probe
+			}
+			e.source = "provider"
+		}
+	}
 	// check existing to preserve manual overrides
 	var existingID string
 	var existingSource string
@@ -285,14 +476,18 @@ func (s *Service) upsert(p *models.Provider, m rawModel) error {
 		// bin or a manual add, never from discovery.
 		return nil
 	}
+	displayName := m.ID
+	if m.DisplayName != "" {
+		displayName = m.DisplayName
+	}
 	if err == nil {
 		_, err = s.db.Exec(db.Q(`UPDATE provider_models SET display_name=?, owned_by=?, context_window=?, max_output=?, input_cost=?, output_cost=?, cache_read_cost=?, cache_write_cost=?, reasoning=?, tool_call=?, structured_output=?, attachment=?, modalities=?, reasoning_type=?, reasoning_levels=?, reasoning_output_limits=?, source=?, updated_at=? WHERE id=?`),
-			m.ID, m.OwnedBy, e.ctx, e.maxOut, e.inputCost, e.outputCost, e.cacheReadCost, e.cacheWriteCost, e.reasoning, e.toolCall, e.structuredOutput, e.attachment, e.modalities, e.reasoningType, e.reasoningLevels, e.reasoningLimits, e.source, time.Now().UTC(), existingID)
+			displayName, m.OwnedBy, e.ctx, e.maxOut, e.inputCost, e.outputCost, e.cacheReadCost, e.cacheWriteCost, e.reasoning, e.toolCall, e.structuredOutput, e.attachment, e.modalities, e.reasoningType, e.reasoningLevels, e.reasoningLimits, e.source, time.Now().UTC(), existingID)
 		return err
 	}
 	id := uuid.NewString()
 	_, err = s.db.Exec(db.Q(`INSERT INTO provider_models(id, provider_id, model_id, display_name, owned_by, context_window, max_output, input_cost, output_cost, cache_read_cost, cache_write_cost, reasoning, tool_call, structured_output, attachment, modalities, reasoning_type, reasoning_levels, reasoning_output_limits, source, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
-		id, p.ID, m.ID, m.ID, m.OwnedBy, e.ctx, e.maxOut, e.inputCost, e.outputCost, e.cacheReadCost, e.cacheWriteCost, e.reasoning, e.toolCall, e.structuredOutput, e.attachment, e.modalities, e.reasoningType, e.reasoningLevels, e.reasoningLimits, e.source, time.Now().UTC(), time.Now().UTC())
+		id, p.ID, m.ID, displayName, m.OwnedBy, e.ctx, e.maxOut, e.inputCost, e.outputCost, e.cacheReadCost, e.cacheWriteCost, e.reasoning, e.toolCall, e.structuredOutput, e.attachment, e.modalities, e.reasoningType, e.reasoningLevels, e.reasoningLimits, e.source, time.Now().UTC(), time.Now().UTC())
 	return err
 }
 
@@ -307,6 +502,56 @@ type enrichment struct {
 	modalities                     string
 	reasoningType, reasoningLevels string
 	reasoningLimits, source        string
+}
+
+// resolveEnrichment merges provider-declared metadata over the models.dev
+// catalog enrichment. Fields the provider's own /models entry declares win
+// per-field — including a declared $0.00 price, which pointer semantics
+// distinguish from "not declared"; undeclared fields keep catalog values.
+// Source records the authoritative origin: "provider" when the listing
+// carried usable detail, else the catalog outcome ("enriched" /
+// "enriched-wildcard" / "discovered").
+func (s *Service) resolveEnrichment(m rawModel) enrichment {
+	e := s.enrichFor(m.ID)
+	if m.Meta == nil {
+		return e
+	}
+	pm := m.Meta
+	if pm.ContextWindow > 0 {
+		e.ctx = pm.ContextWindow
+	}
+	if pm.MaxOutput > 0 {
+		e.maxOut = pm.MaxOutput
+	}
+	if pm.InputCost != nil {
+		e.inputCost = *pm.InputCost
+	}
+	if pm.OutputCost != nil {
+		e.outputCost = *pm.OutputCost
+	}
+	if pm.CacheReadCost != nil {
+		e.cacheReadCost = *pm.CacheReadCost
+	}
+	if pm.CacheWriteCost != nil {
+		e.cacheWriteCost = *pm.CacheWriteCost
+	}
+	if pm.Reasoning != nil {
+		e.reasoning = *pm.Reasoning
+	}
+	if pm.ToolCall != nil {
+		e.toolCall = *pm.ToolCall
+	}
+	if pm.StructuredOutput != nil {
+		e.structuredOutput = *pm.StructuredOutput
+	}
+	if pm.Attachment != nil {
+		e.attachment = *pm.Attachment
+	}
+	if pm.Modalities != "" {
+		e.modalities = pm.Modalities
+	}
+	e.source = "provider"
+	return e
 }
 
 // enrichFor resolves catalog detail for any upstream model ID, including
@@ -652,4 +897,76 @@ func isMultiProvider(p *models.Provider) bool {
 		}
 	}
 	return false
+}
+
+// probeContextLimit asks the provider for its real context cap by sending a
+// tiny completion with an absurd max_tokens; resellers that cap the model
+// (kourier et al.) answer 400 with the leaked limit in the error text. When
+// the upstream doesn't answer the question — auth errors, 404s, free-form
+// errors — the probe returns 0 and catalog/listing values stand.
+//
+// Skips entirely for providers with no API key to probe with.
+func (s *Service) probeContextLimit(p *models.Provider, apiKey, modelID string) int {
+	if apiKey == "" || s.client == nil || p == nil {
+		return 0
+	}
+	// Probe the cheapest endpoint dialect for this provider: OpenAI chat
+	// completions for OpenAI-compatible, Anthropic messages for anthropic
+	// providers (minimax uses the anthropic dialect).
+	var path, body string
+	var authHdr string
+	if p.Type == models.ProviderAnthropic {
+		path = strings.TrimRight(p.BaseURL, "/") + "/messages"
+		if !strings.HasSuffix(p.BaseURL, "/v1") && !strings.Contains(p.BaseURL, "/v1/") {
+			path = strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
+		}
+		body = `{"model":"` + modelID + `","max_tokens":999999,"messages":[{"role":"user","content":"x"}]}`
+		authHdr = "x-api-key"
+	} else {
+		path = strings.TrimRight(p.BaseURL, "/") + "/chat/completions"
+		if !strings.Contains(p.BaseURL, "/v1") {
+			path = strings.TrimRight(p.BaseURL, "/") + "/v1/chat/completions"
+		}
+		body = `{"model":"` + modelID + `","max_tokens":999999,"messages":[{"role":"user","content":"x"}]}`
+		authHdr = "Authorization"
+	}
+	req, err := http.NewRequest("POST", path, strings.NewReader(body))
+	if err != nil {
+		return 0
+	}
+	if authHdr == "Authorization" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	} else {
+		req.Header.Set("x-api-key", apiKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	// Only trust answers that came back fast and look like a real cap error;
+	// 401/404/5xx mean the probe didn't reach a model validator.
+	if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusUnprocessableEntity {
+		return 0
+	}
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	return parseLeakedLimit(string(b))
+}
+
+// parseLeakedLimit extracts the provider's real token cap from a 400 error
+// body. Handles the observed resellers' phrasing:
+//
+//	kourier (bifrost): "max_model_len=max_total_tokens=262144"
+//	vllm/sglang:       "max_model_len", "max_tokens", "context length"
+//	openrouter:        "context length", "max context"
+func parseLeakedLimit(body string) int {
+	re := regexp.MustCompile(`(?:max_model_len|max_total_tokens|context_length|context length|context window|max context)\s*[=:]\s*(\d+)`)
+	if m := re.FindStringSubmatch(body); len(m) == 2 {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 && n < 100_000_000 {
+			return n
+		}
+	}
+	return 0
 }

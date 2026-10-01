@@ -40,7 +40,7 @@ type PendingDelete =
 
 function sourceTone(source?: string): 'neutral'|'good'|'warn' {
   if(source==='manual') return 'warn'
-  if(source==='enriched') return 'good'
+  if(source==='provider'||source==='enriched') return 'good'
   return 'neutral'
 }
 

@@ -58,7 +58,7 @@ func (s *Service) upsertAntigravity(p *models.Provider, pm antigravity.PublicMod
 		return nil
 	}
 	// Reuse generic upsert path but force enriched costs from the static catalog.
-	if err := s.upsert(p, m); err != nil {
+	if err := s.upsert(p, m, "", nil); err != nil {
 		return err
 	}
 	return s.writeAntigravityRow(p.ID, m.ID, pm)

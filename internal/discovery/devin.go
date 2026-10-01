@@ -91,7 +91,7 @@ func (s *Service) upsertDevin(p *models.Provider, g devin.CollapsedModel) error 
 	if s.isManual(p.ID, g.ID) {
 		return nil
 	}
-	if err := s.upsert(p, rawModel{ID: g.ID, OwnedBy: "devin"}); err != nil {
+	if err := s.upsert(p, rawModel{ID: g.ID, OwnedBy: "devin"}, "", nil); err != nil {
 		return err
 	}
 	return s.writeDevinRow(p.ID, g.ID, g)
