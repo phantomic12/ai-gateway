@@ -11,6 +11,8 @@ import (
 
 	gatewaydb "ai-gateway/internal/db"
 
+	"ai-gateway/internal/models"
+
 	"github.com/rs/zerolog/log"
 )
 
@@ -100,6 +102,7 @@ func checkAll(db *sql.DB, store *Store) {
 					targetModels = baseModels + "/v1/models"
 				}
 				req, _ := http.NewRequest("GET", targetModels, nil)
+				req.Header.Set("User-Agent", models.GatewayUserAgent)
 				req.Header.Set("x-api-key", key)
 				req.Header.Set("anthropic-version", "2023-06-01")
 				resp, err := client.Do(req)
@@ -138,6 +141,7 @@ func checkAll(db *sql.DB, store *Store) {
 				success := false
 				for _, u := range urls {
 					req, _ := http.NewRequest("GET", u, nil)
+					req.Header.Set("User-Agent", models.GatewayUserAgent)
 					req.Header.Set("api-key", key)
 					resp, err := client.Do(req)
 					if err != nil {
@@ -187,6 +191,7 @@ func checkAll(db *sql.DB, store *Store) {
 				success := false
 				for _, u := range urls {
 					req, _ := http.NewRequest("GET", u, nil)
+					req.Header.Set("User-Agent", models.GatewayUserAgent)
 					req.Header.Set("Authorization", "Bearer "+key)
 					resp, err := client.Do(req)
 					if err != nil {
@@ -238,6 +243,7 @@ func checkAll(db *sql.DB, store *Store) {
 						anthTarget = baseAnth + "/models"
 					}
 					if req, _ := http.NewRequest("GET", anthTarget, nil); req != nil {
+						req.Header.Set("User-Agent", models.GatewayUserAgent)
 						req.Header.Set("x-api-key", key)
 						req.Header.Set("anthropic-version", "2023-06-01")
 						if resp, err := client.Do(req); err == nil {

@@ -2,6 +2,14 @@ package models
 
 import "time"
 
+// GatewayUserAgent is the User-Agent the gateway presents on every outbound
+// request to a provider upstream. Go's net/http default ("Go-http-client/1.1")
+// is rejected with HTTP 403 by the Cloudflare WAF in front of some upstreams
+// (verified against inference-api.nousresearch.com — error 1010 "you have been
+// blocked"), which silently broke model discovery, chat proxying, and health
+// probes for those providers. Always set this explicitly on outbound requests.
+const GatewayUserAgent = "ai-gateway/1.7.0"
+
 type ProviderType string
 
 const (

@@ -749,6 +749,16 @@ func (h *Handler) newUpstreamRequest(ctx context.Context, r *http.Request, targe
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Never relay a Go-derived User-Agent to an upstream. Go's net/http
+	// default ("Go-http-client/1.1") is blocked with HTTP 403 by the
+	// Cloudflare WAF fronting some providers (inference-api.nousresearch.com
+	// — error 1010 "you have been blocked"). Clients that send no UA, or
+	// send the Go default verbatim, poison the upstream call; substitute the
+	// gateway's identity (see models.GatewayUserAgent). A real client UA
+	// (curl, httpx, browser) is left intact.
+	if ua := req.Header.Get("User-Agent"); ua == "" || strings.HasPrefix(ua, "Go-http-client") {
+		req.Header.Set("User-Agent", models.GatewayUserAgent)
+	}
 	if isStream {
 		req.Header.Set("Accept", "text/event-stream")
 	} else {
@@ -3385,6 +3395,7 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 			log.Warn().Err(rerr).Str("provider", prov.Name).Str("target", target).Msg("models probe: bad upstream URL, skipping")
 			continue
 		}
+		req.Header.Set("User-Agent", models.GatewayUserAgent)
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 		resp, err := h.Client.Do(req)
 		if err != nil {
@@ -3742,6 +3753,11 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 				if v := r.Header.Get(hk); v != "" {
 					req.Header.Set(hk, v)
 				}
+			}
+			// Same WAF guard as newUpstreamRequest: never send Go's default
+			// User-Agent (or nothing) upstream — Cloudflare 403s it.
+			if ua := req.Header.Get("User-Agent"); ua == "" || strings.HasPrefix(ua, "Go-http-client") {
+				req.Header.Set("User-Agent", models.GatewayUserAgent)
 			}
 			if isOpencodeTarget(target) && req.Header.Get("x-opencode-session") == "" {
 				req.Header.Set("x-opencode-session", opencodeSessionForRequest(r))

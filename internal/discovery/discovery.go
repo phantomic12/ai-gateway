@@ -372,6 +372,7 @@ func (s *Service) fetchOpenAI(p *models.Provider, apiKey string) []rawModel {
 	}
 	for _, u := range urls {
 		req, _ := http.NewRequest("GET", u, nil)
+		req.Header.Set("User-Agent", models.GatewayUserAgent)
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 		resp, err := s.client.Do(req)
 		if err != nil || resp.StatusCode != 200 {
@@ -394,6 +395,7 @@ func (s *Service) fetchAzure(p *models.Provider, apiKey string) []rawModel {
 	urls := []string{base + "/models?api-version=2024-02-01", base + "/models"}
 	for _, u := range urls {
 		req, _ := http.NewRequest("GET", u, nil)
+		req.Header.Set("User-Agent", models.GatewayUserAgent)
 		req.Header.Set("api-key", apiKey)
 		resp, err := s.client.Do(req)
 		if err != nil || resp.StatusCode != 200 {
@@ -426,6 +428,7 @@ func (s *Service) fetchAnthropic(p *models.Provider, apiKey string) []rawModel {
 	}
 	for _, target := range urls {
 		req, _ := http.NewRequest("GET", target, nil)
+		req.Header.Set("User-Agent", models.GatewayUserAgent)
 		req.Header.Set("x-api-key", apiKey)
 		req.Header.Set("anthropic-version", "2023-06-01")
 		resp, err := s.client.Do(req)
@@ -934,6 +937,7 @@ func (s *Service) probeContextLimit(p *models.Provider, apiKey, modelID string) 
 	if err != nil {
 		return 0
 	}
+	req.Header.Set("User-Agent", models.GatewayUserAgent)
 	if authHdr == "Authorization" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	} else {
